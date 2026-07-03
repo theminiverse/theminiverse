@@ -1,9 +1,11 @@
 import express from 'express';
 import http from 'node:http';
 import path from 'node:path';
+import { randomInt } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import db from './db.js';
+import { createRateLimiter } from './lib/rateLimit.js';
 import {
   TOTAL_ROUNDS,
   allScored,
@@ -15,19 +17,41 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 const MAX_SCORE = 10000;
+// A game seats at most a handful of tables of ~5, so a real roster never gets
+// near this. The cap exists so an abuser can't inflate one game's roster (and
+// thus every broadcast's payload) without bound.
+const MAX_PLAYERS = 200;
 
 const app = express();
-app.use(express.json());
+// Trust the platform's reverse proxy (Railway) so req.ip reflects the real
+// client for rate limiting rather than the proxy's address.
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '16kb' }));
 
-// Codes avoid look-alike characters (0/O, 1/I).
+// Conservative security headers. There's no inline-script/HTML-injection sink
+// today (React escapes all output), so this is defense-in-depth.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
+// Codes avoid look-alike characters (0/O, 1/I). Drawn from a CSPRNG so active
+// game codes can't be predicted from prior ones.
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function newCode() {
   let code = '';
   for (let i = 0; i < 5; i++) {
-    code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    code += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
   }
   return code;
 }
+
+// Per-IP cap on game creation and per-socket cap on mutations, so no single
+// client can exhaust disk (games/players) or CPU (recompute + broadcast).
+const createGameLimiter = createRateLimiter({ windowMs: 60_000, limit: 20 });
+const socketEventLimiter = createRateLimiter({ windowMs: 10_000, limit: 60 });
 
 const normCode = (code) => String(code || '').trim().toUpperCase();
 
@@ -75,6 +99,9 @@ function buildState(code) {
 }
 
 app.post('/api/games', (req, res) => {
+  if (createGameLimiter(req.ip)) {
+    return res.status(429).json({ error: 'Too many games created, slow down' });
+  }
   let code;
   do {
     code = newCode();
@@ -90,7 +117,9 @@ app.get('/api/games/:code', (req, res) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server);
+// Cap inbound frame size (default is 1 MB) — clients only ever send tiny
+// join/score payloads, so anything larger is abuse.
+const io = new Server(server, { maxHttpBufferSize: 16 * 1024 });
 
 function broadcast(code) {
   const state = buildState(code);
@@ -115,6 +144,10 @@ function addOrFindPlayer(game, rawName) {
     .prepare('SELECT id FROM players WHERE game_code = ? AND lower(name) = lower(?)')
     .get(game.code, name);
   if (existing) return { playerId: existing.id, created: false };
+  const { count } = db
+    .prepare('SELECT COUNT(*) AS count FROM players WHERE game_code = ?')
+    .get(game.code);
+  if (count >= MAX_PLAYERS) return { error: 'This game is full' };
   const info = db
     .prepare('INSERT INTO players (game_code, name) VALUES (?, ?)')
     .run(game.code, name);
@@ -146,7 +179,16 @@ function advanceIfComplete(code) {
 }
 
 io.on('connection', (socket) => {
+  const rateLimited = (cb) => {
+    if (socketEventLimiter(socket.id)) {
+      cb({ error: 'Too many requests, slow down' });
+      return true;
+    }
+    return false;
+  };
+
   socket.on('game:join', (payload = {}, cb = () => {}) => {
+    if (rateLimited(cb)) return;
     const game = getGame(payload.code);
     if (!game) return cb({ error: 'Game not found' });
     const result = addOrFindPlayer(game, payload.name);
@@ -157,6 +199,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('player:add', (payload = {}, cb = () => {}) => {
+    if (rateLimited(cb)) return;
     const game = getGame(payload.code);
     if (!game) return cb({ error: 'Game not found' });
     const result = addOrFindPlayer(game, payload.name);
@@ -167,6 +210,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('score:set', (payload = {}, cb = () => {}) => {
+    if (rateLimited(cb)) return;
     const game = getGame(payload.code);
     if (!game) return cb({ error: 'Game not found' });
     const player = db
