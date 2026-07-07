@@ -37,25 +37,29 @@ export default function HistoryPanel({ state }) {
         <p className="history-empty">No changes yet.</p>
       ) : (
         <ul className="history-list">
-          {history.map((e) => (
-            <li key={e.id} className={`history-item history-${e.type}`}>
-              <span className="history-icon" aria-hidden="true">
-                {ICONS[e.type] || '•'}
-              </span>
-              <span className="history-body">
-                <span className="history-text">
-                  <strong className="history-actor">{e.actor}</strong>{' '}
-                  <span className={e.type === 'score' && e.undone ? 'history-undone' : ''}>
-                    {e.description}
-                  </span>
-                  {e.type === 'score' && e.undone && (
-                    <span className="history-badge">undone</span>
-                  )}
+          {history.map((e) => {
+            // `undone` arrives as SQLite's 0/1 integer. Coerce to a real boolean
+            // so a falsy `0` is never rendered as stray "0" text by React's
+            // `cond && <node>` short-circuit.
+            const undone = e.type === 'score' && Boolean(e.undone);
+            return (
+              <li key={e.id} className={`history-item history-${e.type}`}>
+                <span className="history-icon" aria-hidden="true">
+                  {ICONS[e.type] || '•'}
                 </span>
-                <time className="history-time">{timeAgo(e.createdAt)}</time>
-              </span>
-            </li>
-          ))}
+                <span className="history-body">
+                  <span className="history-text">
+                    <strong className="history-actor">{e.actor}</strong>{' '}
+                    <span className={undone ? 'history-undone' : ''}>
+                      {e.description}
+                    </span>
+                    {undone && <span className="history-badge">undone</span>}
+                  </span>
+                  <time className="history-time">{timeAgo(e.createdAt)}</time>
+                </span>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
