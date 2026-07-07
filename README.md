@@ -21,6 +21,11 @@ same board.
   (or the code itself). Players join by typing their name — no accounts.
 - **Anyone can do anything.** Any player can add other players and enter or fix
   anyone's score, for any round. Every change syncs to all devices instantly.
+- **Version history + undo/redo.** A live feed records every change — who set
+  or cleared which score, who joined, who added whom — with timestamps. Made a
+  mistake? The shared **Undo** / **Redo** buttons step the whole table back and
+  forth through score edits, newest first. Undone entries stay in the history,
+  struck through, so you can always see what happened.
 - **Rounds auto-advance.** Once every player has a score for the current round,
   it closes and the next round opens.
 - **Cumulative leaderboard.** Running total per player across all rounds,
