@@ -43,5 +43,13 @@ export function useGameSocket(code, name) {
     socketRef.current?.emit('player:add', { code, name: playerName }, cb);
   };
 
-  return { state, playerId, joinError, setScore, addPlayer };
+  const undo = (cb) => {
+    socketRef.current?.emit('history:undo', { code }, cb);
+  };
+
+  const redo = (cb) => {
+    socketRef.current?.emit('history:redo', { code }, cb);
+  };
+
+  return { state, playerId, joinError, setScore, addPlayer, undo, redo };
 }

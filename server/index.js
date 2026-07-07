@@ -13,6 +13,7 @@ import {
   seatingForRound,
   shuffle
 } from './lib/game.js';
+import { describeScoreChange, nextRedoable, nextUndoable } from './lib/history.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -76,12 +77,82 @@ function getScores(code) {
   return scores;
 }
 
+function getPlayerName(code, playerId) {
+  const row = db
+    .prepare('SELECT name FROM players WHERE id = ? AND game_code = ?')
+    .get(playerId, code);
+  return row ? row.name : `Player ${playerId}`;
+}
+
+// Current stored score for a cell, or null when the cell is empty.
+function getScoreValue(code, playerId, round) {
+  const row = db
+    .prepare('SELECT value FROM scores WHERE game_code = ? AND player_id = ? AND round = ?')
+    .get(code, playerId, round);
+  return row ? row.value : null;
+}
+
+// Write a single cell. A null value clears it. This is the one place that
+// mutates the scores table, so undo/redo and edits all go through it.
+function writeScore(code, playerId, round, value) {
+  if (value === null || value === undefined) {
+    db.prepare('DELETE FROM scores WHERE game_code = ? AND player_id = ? AND round = ?').run(
+      code,
+      playerId,
+      round
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO scores (game_code, player_id, round, value) VALUES (?, ?, ?, ?)
+       ON CONFLICT(game_code, player_id, round) DO UPDATE SET value = excluded.value`
+    ).run(code, playerId, round, value);
+  }
+}
+
+function recordEvent(code, event) {
+  db.prepare(
+    `INSERT INTO events
+       (game_code, actor, type, description, player_id, round, prev_value, new_value, undoable)
+     VALUES (@game_code, @actor, @type, @description, @player_id, @round, @prev_value, @new_value, @undoable)`
+  ).run({
+    game_code: code,
+    actor: event.actor,
+    type: event.type,
+    description: event.description,
+    player_id: event.playerId ?? null,
+    round: event.round ?? null,
+    prev_value: event.prevValue ?? null,
+    new_value: event.newValue ?? null,
+    undoable: event.undoable ? 1 : 0
+  });
+}
+
+// The score events relevant to the undo/redo stack (flags only), plus the
+// full row for a given id when we need to apply a reversal.
+function undoRedoEvents(code) {
+  return db
+    .prepare(
+      'SELECT id, undoable, undone, abandoned FROM events WHERE game_code = ? AND undoable = 1'
+    )
+    .all(code);
+}
+
+function buildHistory(code) {
+  return db
+    .prepare(
+      `SELECT id, actor, type, description, undone, created_at AS createdAt
+       FROM events WHERE game_code = ? ORDER BY id DESC LIMIT 50`
+    )
+    .all(code);
+}
+
 function buildState(code) {
   const game = getGame(code);
   if (!game) return null;
   const players = getPlayers(game.code);
   const scores = getScores(game.code);
   const board = leaderboard(players, scores);
+  const events = undoRedoEvents(game.code);
   const state = {
     code: game.code,
     status: game.status,
@@ -90,7 +161,10 @@ function buildState(code) {
     players,
     scores,
     leaderboard: board,
-    seating: seatingForRound(players, scores, game.current_round, JSON.parse(game.round1_order))
+    seating: seatingForRound(players, scores, game.current_round, JSON.parse(game.round1_order)),
+    history: buildHistory(game.code),
+    canUndo: nextUndoable(events) !== null,
+    canRedo: nextRedoable(events) !== null
   };
   if (game.status === 'finished' && board.length > 0) {
     state.winners = board.filter((e) => e.total === board[0].total).map((e) => e.playerId);
@@ -187,12 +261,21 @@ io.on('connection', (socket) => {
     return false;
   };
 
+  // The name this socket acts as, used to attribute changes in the history
+  // feed. Set on join and reused for later mutations from the same connection.
+  const actorName = () => socket.data.name || 'Someone';
+
   socket.on('game:join', (payload = {}, cb = () => {}) => {
     if (rateLimited(cb)) return;
     const game = getGame(payload.code);
     if (!game) return cb({ error: 'Game not found' });
     const result = addOrFindPlayer(game, payload.name);
     if (result.error) return cb(result);
+    const name = getPlayerName(game.code, result.playerId);
+    socket.data.name = name;
+    if (result.created) {
+      recordEvent(game.code, { actor: name, type: 'join', description: 'joined the game' });
+    }
     socket.join(`game:${game.code}`);
     const state = broadcast(game.code);
     cb({ ok: true, playerId: result.playerId, state });
@@ -205,6 +288,11 @@ io.on('connection', (socket) => {
     const result = addOrFindPlayer(game, payload.name);
     if (result.error) return cb(result);
     if (!result.created) return cb({ error: 'That player is already in the game' });
+    recordEvent(game.code, {
+      actor: actorName(),
+      type: 'player_add',
+      description: `added ${getPlayerName(game.code, result.playerId)}`
+    });
     broadcast(game.code);
     cb({ ok: true, playerId: result.playerId });
   });
@@ -224,25 +312,82 @@ io.on('connection', (socket) => {
     if (game.status === 'active' && round > game.current_round) {
       return cb({ error: `Round ${round} has not started yet` });
     }
+    let newValue;
     if (payload.value === null || payload.value === '') {
-      db.prepare('DELETE FROM scores WHERE game_code = ? AND player_id = ? AND round = ?').run(
-        game.code,
-        player.id,
-        round
-      );
+      newValue = null;
     } else {
       const value = Number(payload.value);
       if (!Number.isInteger(value) || value < 0 || value > MAX_SCORE) {
         return cb({ error: `Score must be a whole number between 0 and ${MAX_SCORE}` });
       }
-      db.prepare(
-        `INSERT INTO scores (game_code, player_id, round, value) VALUES (?, ?, ?, ?)
-         ON CONFLICT(game_code, player_id, round) DO UPDATE SET value = excluded.value`
-      ).run(game.code, player.id, round, value);
+      newValue = value;
     }
+
+    const prevValue = getScoreValue(game.code, player.id, round);
+    // No-op edits (re-entering the same value, clearing an empty cell) don't
+    // belong in the history and shouldn't disturb the redo stack.
+    if (prevValue === newValue) {
+      broadcast(game.code);
+      return cb({ ok: true });
+    }
+
+    writeScore(game.code, player.id, round, newValue);
+    // A fresh edit discards anything left on the redo stack.
+    db.prepare(
+      'UPDATE events SET abandoned = 1 WHERE game_code = ? AND undoable = 1 AND undone = 1 AND abandoned = 0'
+    ).run(game.code);
+    recordEvent(game.code, {
+      actor: actorName(),
+      type: 'score',
+      description: describeScoreChange(getPlayerName(game.code, player.id), round, newValue),
+      playerId: player.id,
+      round,
+      prevValue,
+      newValue,
+      undoable: true
+    });
+
     advanceIfComplete(game.code);
     broadcast(game.code);
     cb({ ok: true });
+  });
+
+  // Undo/redo operate on the shared, game-wide stack of score edits: undo
+  // reverts the most recent edit, redo replays the most recently undone one.
+  const applyStackMove = (payload, cb, direction) => {
+    const game = getGame(payload.code);
+    if (!game) return cb({ error: 'Game not found' });
+    const events = undoRedoEvents(game.code);
+    const target =
+      direction === 'undo' ? nextUndoable(events) : nextRedoable(events);
+    if (!target) {
+      return cb({ error: direction === 'undo' ? 'Nothing to undo' : 'Nothing to redo' });
+    }
+    const full = db.prepare('SELECT * FROM events WHERE id = ?').get(target.id);
+    const restore = direction === 'undo' ? full.prev_value : full.new_value;
+    writeScore(game.code, full.player_id, full.round, restore ?? null);
+    db.prepare('UPDATE events SET undone = ? WHERE id = ?').run(
+      direction === 'undo' ? 1 : 0,
+      full.id
+    );
+    recordEvent(game.code, {
+      actor: actorName(),
+      type: direction,
+      description: `${direction === 'undo' ? 'undid' : 'redid'} ${full.actor}'s change (${full.description})`
+    });
+    advanceIfComplete(game.code);
+    broadcast(game.code);
+    cb({ ok: true });
+  };
+
+  socket.on('history:undo', (payload = {}, cb = () => {}) => {
+    if (rateLimited(cb)) return;
+    applyStackMove(payload, cb, 'undo');
+  });
+
+  socket.on('history:redo', (payload = {}, cb = () => {}) => {
+    if (rateLimited(cb)) return;
+    applyStackMove(payload, cb, 'redo');
   });
 });
 

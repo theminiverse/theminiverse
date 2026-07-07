@@ -33,6 +33,27 @@ db.exec(`
     UNIQUE(game_code, player_id, round)
   );
   CREATE INDEX IF NOT EXISTS idx_scores_game ON scores(game_code);
+
+  -- Append-only audit log powering the version history feed and the shared
+  -- undo/redo stack. Every mutation is recorded with the acting player's name.
+  -- Only score events are undoable; 'undone' marks one currently reverted (and
+  -- thus redoable), 'abandoned' marks a redoable event discarded by a newer edit.
+  CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_code TEXT NOT NULL REFERENCES games(code),
+    actor TEXT NOT NULL,
+    type TEXT NOT NULL,
+    description TEXT NOT NULL,
+    player_id INTEGER,
+    round INTEGER,
+    prev_value INTEGER,
+    new_value INTEGER,
+    undoable INTEGER NOT NULL DEFAULT 0,
+    undone INTEGER NOT NULL DEFAULT 0,
+    abandoned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_events_game ON events(game_code, id);
 `);
 
 export default db;

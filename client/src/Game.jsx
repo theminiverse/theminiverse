@@ -6,6 +6,7 @@ import ScoreGrid from './components/ScoreGrid.jsx';
 import TableMap from './components/TableMap.jsx';
 import AddPlayer from './components/AddPlayer.jsx';
 import WinnerBanner from './components/WinnerBanner.jsx';
+import HistoryPanel from './components/HistoryPanel.jsx';
 
 const nameKey = (code) => `shanghai:${code}:name`;
 
@@ -14,7 +15,10 @@ export default function Game({ code, navigate }) {
   const [draftName, setDraftName] = useState(() => localStorage.getItem('shanghai:name') || '');
   const [toast, setToast] = useState(null);
   const [copied, setCopied] = useState(false);
-  const { state, playerId, joinError, setScore, addPlayer } = useGameSocket(code, name);
+  const { state, playerId, joinError, setScore, addPlayer, undo, redo } = useGameSocket(
+    code,
+    name
+  );
 
   const showError = (message) => {
     setToast(message);
@@ -52,6 +56,9 @@ export default function Game({ code, navigate }) {
       cb?.(res);
     });
   };
+
+  const handleUndo = () => undo((res) => res?.error && showError(res.error));
+  const handleRedo = () => redo((res) => res?.error && showError(res.error));
 
   if (!name) {
     return (
@@ -106,6 +113,24 @@ export default function Game({ code, navigate }) {
               ? 'Game over'
               : `Round ${state.currentRound} of ${state.totalRounds}`}
           </span>
+          <div className="undo-redo" role="group" aria-label="Undo and redo">
+            <button
+              className="btn btn-small"
+              onClick={handleUndo}
+              disabled={!state.canUndo}
+              title="Undo the last score change"
+            >
+              ↶ Undo
+            </button>
+            <button
+              className="btn btn-small"
+              onClick={handleRedo}
+              disabled={!state.canRedo}
+              title="Redo the last undone change"
+            >
+              Redo ↷
+            </button>
+          </div>
           <button className="btn btn-small" onClick={copyLink}>
             {copied ? 'Copied!' : 'Copy invite link'}
           </button>
@@ -131,6 +156,10 @@ export default function Game({ code, navigate }) {
 
       <section className="panel panel-wide">
         <ScoreGrid state={state} playerId={playerId} onSetScore={handleSetScore} />
+      </section>
+
+      <section className="panel panel-wide">
+        <HistoryPanel state={state} />
       </section>
     </div>
   );
